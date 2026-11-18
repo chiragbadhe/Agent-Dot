@@ -2,13 +2,6 @@
 
 **A tiny RGB status light that clips to the top of your laptop screen and shows what your AI agent is doing.**
 
-<p align="center">
-  <a href="media/AgentDot_promo_v4.mp4"><img src="docs/images/demo.gif" width="300" alt="Agent Dot demo: the light goes from idle to working, needs you and done"></a>
-  &nbsp;&nbsp;
-  <img src="hardware/drawings/views/07_mounted.png" width="420" alt="Agent Dot mounted on a MacBook (render)">
-</p>
-
-<p align="center"><b><a href="media/AgentDot_promo_v4.mp4">▶ Watch the full demo (84 s)</a></b></p>
 
 | Light | Meaning |
 |---|---|
@@ -121,4 +114,3 @@ Built and tested on a MacBook Pro (M4 Pro, 4.0 mm lid). The v12 case holds an ES
 ## License
 
 [MIT](LICENSE) – code, CAD and documentation.
-# Agent-Dot
