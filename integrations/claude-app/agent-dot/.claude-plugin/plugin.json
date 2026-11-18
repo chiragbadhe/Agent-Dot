@@ -1,0 +1,9 @@
+{
+  "name": "agent-dot",
+  "version": "0.1.0",
+  "description": "Shows Claude's status on your Agent Dot light (working, waiting, done) through the ntfy.sh relay.",
+  "license": "MIT",
+  "author": {
+    "name": "Agent Dot contributors"
+  }
+}

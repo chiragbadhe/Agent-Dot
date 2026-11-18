@@ -1,0 +1,15 @@
+# build outputs
+hardware/cad/out/
+*.FCBak
+.pio/
+build/
+# editors / OS
+.DS_Store
+*.swp
+*~
+# never commit your own Wi-Fi password or relay topic edits by accident
+firmware/AgentDot/secrets.h
+# local light address written by the installers
+.agentdot/
+# compiled Mac watcher
+mac/AgentDotWatch

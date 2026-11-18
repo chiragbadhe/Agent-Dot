@@ -1,0 +1,68 @@
+AGENT DOT v12 - one-piece body + cover, ESP32 SuperMini + TP4056, one LED pixel  (lid 4.0 mm)
+==============================================================================
+
+1. Parts
+[PASS] Body             valid single solid (9505 mm3)
+[PASS] Enclosure_Cover  valid single solid (6207 mm3)
+[PASS] LED_End_Plug     valid single solid (70 mm3)
+[PASS] Pad_Front_L      valid single solid (4 mm3)
+[PASS] Pad_Front_R      valid single solid (4 mm3)
+[PASS] Pad_Top          valid single solid (131 mm3)
+[PASS] Pad_Rear         valid single solid (149 mm3)
+[PASS] Pad_Rear_Low     valid single solid (1890 mm3)
+[PASS] Pad_Battery      valid single solid (429 mm3)
+[PASS] Only two printed bodies + end plug (body = LED box + clamp + controller box) 
+
+2. Interference (all parts incl. electronics)
+   overlap Body                   x Screw_M2x6_1           3.63 mm3  screw thread engagement
+   overlap Body                   x Screw_M2x6_2           3.63 mm3  screw thread engagement
+[PASS] No unintended interference 
+
+3. Electronics
+   box inside: 28.8 W x 87.1 H x 7.4 D
+[PASS] Battery bay takes cells up to 6.0 x 25.5 x 36.0 mm (with 0.6 mm TPU pad) 
+[PASS] TP4056 board fits its slot 
+[PASS] TP4056 drops in from the back (cover off) 
+[PASS] TP4056 USB-C: plug reaches the port through the left wall 
+[PASS] ESP32_SuperMini board fits its slot 
+[PASS] ESP32_SuperMini drops in from the back (cover off) 
+[PASS] ESP32_SuperMini USB-C: plug reaches the port through the left wall 
+[PASS] TP4056 bay takes boards up to 28 mm long 
+[PASS] Micro switch (6.7 x 2.6 x 1.4) sits in its pocket 
+[PASS] Switch lever free at -0.75 mm of travel 
+[PASS] Switch lever free at +0.75 mm of travel 
+[PASS] Switch lever reachable from outside (lever tip 15.80, recess 15.30)
+[PASS] Switch held in by the cover 
+[PASS] Screw_M2x6_1 clears electronics (3.15)
+[PASS] Screw_M2x6_2 clears electronics (4.54)
+
+4. LED box (6 mm, one pixel at the back)
+[PASS] LED box height 6.0 mm above the lid pad 
+[PASS] Pixel (17 x 10 mm) lies at the back, clear of the box 
+[PASS] Pixel slides in through the right end (then the end plug) 
+[PASS] Diffuser slides in through the right end 
+[PASS] Diffuser covers the window 
+   light: pixel 3.4 mm behind the diffuser; window 22 x 2.8 mm
+[PASS] Wire hole: pixel end -> straight down into the box (3.4 x 6.3 mm)
+[PASS] Wire band above the battery is open (3.5 mm) 
+
+5. Cover
+[PASS] Cover fits: drop 1.6 mm low, slide up 
+[PASS] Cover hooked at the top 
+[PASS] Cover cannot slide sideways 
+[PASS] Cover screws: 2 x M2x6, thread in post >= 3 mm (4.4 mm)
+
+6. Laptop
+[PASS] Pad-to-pad gap = lid - squeeze (3.90 mm)
+[PASS] Webcam keep-out clear 
+
+7. Printability (no supports)
+[PASS] Body             no supports (widest bridge 11.5 mm, build 32.0 x 18.1 x 96.3)
+[PASS] Enclosure_Cover  no supports (widest bridge 1.3 mm, build 32.0 x 88.5 x 9.3)
+[PASS] LED_End_Plug     no supports (widest bridge 0.0 mm, build 2.9 x 2.3 x 10.7)
+
+8. Size
+   one-piece body: 32.0 W x 96.3 H x 18.1 D
+   above the lid edge: 6.8 mm; behind the lid: 11.0 mm; box reaches 89.5 mm down
+
+OVERALL: ALL CHECKS PASSED

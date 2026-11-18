@@ -1,0 +1,1086 @@
+# -*- coding: utf-8 -*-
+"""
+Agent Dot - parametric FreeCAD macro (FreeCAD 0.21 / 1.x, Part workbench).   MIT License
+A tiny AI-agent status light that clips onto the top edge of a laptop lid.
+
+ONE macro builds every design variant from the parameter dict P (below); a variant is just a set of overrides:
+    v12 (recommended)  LED_LAYOUT='single', ONE_PIECE=True, BOARD='supermini'   -> see v12.py
+        one-piece body (6 mm LED box + lid clamp + controller box) + cover; ESP32 SuperMini + TP4056,
+        one RGB pixel at the back of the LED box. build() -> build_sm()
+    v9-v11             LED_LAYOUT='floor'  - LED unit (LED box + clamp) + separate controller box + cover
+    v8                 LED_LAYOUT='back', LED_VARIANT='strip60' - 60 mm box, strip upright behind a window
+See docs/CAD.md for the structure, every parameter group and the build / validate / render scripts.
+
+HOW TO USE
+  GUI : Macro > Macros... > select this file > Execute.  Edit P, run again.
+  CLI : freecadcmd -c "EXPORT_DIR='out'; exec(open('agent_dot.FCMacro').read())"
+        other scripts exec() this file with EXPORT_DIR=None and call build(P) themselves.
+
+COORDINATES (mm): X along the lid edge (+X = user's right), Y depth (Y=0 = screen glass,
+-Y toward the user, lid occupies 0..LAPTOP_T), Z up (Z=0 = top edge of the lid).
+Values marked MEASURE are nominal datasheet / part-name values - check yours.
+"""
+import math, os
+import FreeCAD as App
+import Part
+from FreeCAD import Vector as V
+
+P = dict(
+    # ---- laptop / clip ------------------------------------------------------
+    LAPTOP_T      = 4.0,   # lid thickness at the top edge (MEASURE). Test clips: 4.0-5.5
+    SQUEEZE       = 0.10,  # total pad compression. Snug, not tight.
+    PAD_T         = 0.8,   # TPU pads (front, top, rear)
+    W             = 32.0,  # width of the whole device (LED cap = box = clip)
+    LIP_T         = 1.6,   # front finger thickness
+    LIP_H         = 3.0,   # finger reach down the bezel
+    CAM_GAP       = 12.0,  # webcam gap between the two fingers
+    TOP_T         = 2.0,   # clip top bridge
+    RP_T          = 1.6,   # slim rear wall: the box front wall, and the LED unit's jaw that replaces it at the top
+    LEDBOX_REAR   = 3.2,   # LED box reaches this far behind the lid pad (keeps the LED box unchanged)
+    JAW_Z0        = -8.0,  # bottom of the rear jaw (Z = 0 is the lid edge)
+    JOINT_X       = 12.3,  # 2 x M2x6 countersunk joint screws: through the jaw (heads under the rear pad) into the box
+    PLAN_R        = 2.0,   # rounding of the front corners (top view)
+    # ---- printing -----------------------------------------------------------
+    WALL          = 1.6,
+    CLR           = 0.20,
+    DOWEL_D       = 1.90,  # 1.75 mm filament dowels
+    # ---- LED cap ------------------------------------------------------------
+    LED_PCB_L     = 25.0, LED_PCB_H = 4.0, LED_PCB_T = 0.8,    # MEASURE
+    LED_HT        = 0.84, LED_N = 3, LED_PITCH = 10.0,         # WS2812B-2020
+    FW_T          = 1.2,   # window frame (front wall)
+    STRIP_T       = 1.0,   # slide-in diffuser strip thickness (MEASURE your material)
+    STRIP_H       = 4.0,
+    STRIP_CLR     = 0.15,
+    RAIL_T        = 0.6,
+    MIX_GAP       = 1.2,
+    H_ROOF        = 1.2,   # cap roof
+    H_END         = 3.0,
+    SKIRT_T       = 1.2,   # cap skirt: covers the wire groove between the lid edge and the box
+    BOX_TOP_Z     = -1.0,  # top of the electronics box (below the lid edge = invisible from the front)
+    GROOVE_D      = 1.2,   # wire groove depth in the back of the clip rear plate
+    WIN_H         = 2.8,   # light window height
+    WIRE_WIN_W    = 10.0,  # wire window (cap -> box) width
+    # ---- LED CAP VARIANT ------------------------------------------------------
+    LED_VARIANT   = 'strip60',   # 'strip60' = 60 mm cap for a 12 mm WS2812B strip; 'pcb32' = original 32 mm cap
+    # 12 mm addressable strip (WS2812B / SK6812 5050, 144 LED/m: 12 mm FPC, ~6.94 mm per LED)
+    LS_W          = 10.0,  # strip width (10 mm default, 12 mm also fine)   MEASURE
+    LS_FPC_T      = 0.5,   # FPC + adhesive tape                 MEASURE
+    LS_LED_H      = 1.6,   # 5050 LED height                     MEASURE
+    LS_LED        = 5.0,   # 5050 LED body
+    LS_PITCH      = 1000.0 / 60,    # LED pitch: 60 LED/m (use 1000/144 for 144 LED/m)   MEASURE
+    LS_N          = 3,     # LEDs in the piece you cut (3 x 16.7 = 50 mm)
+    C60_L         = 60.0,  # cap length
+    LED_LAYOUT    = 'back', # 'back' = strip upright on a backer wall, light out of the front window
+                            # 'floor' = 5 mm LOW-PROFILE box: strip lies flat on the floor (LEDs up), a sloped
+                            #           reflector roof turns the light forward through the FRONT diffuser
+    C5_H          = 5.0,   # 'floor' layout: LED box height above the clamp top
+    C5_FLOOR      = 0.8,   # 'floor' layout: floor thickness
+    C5_ROOF       = 0.8,
+    # ---- v12: one-piece body (LED box + clamp + controller box) for an ESP32 SuperMini + TP4056 board
+    ONE_PIECE     = False, # True: LED unit and controller box are ONE print (+ the cover)
+    BOARD         = 'xiao',# 'xiao' (built-in charger) or 'supermini' (ESP32-S3/C3 SuperMini + TP4056 USB-C module)
+    SM_L          = 22.6, SM_W = 18.1, SM_PCB = 1.0,    # ESP32 SuperMini board (USB-C on a short edge)   MEASURE
+    TP_L          = 28.0, TP_W = 17.6, TP_PCB = 1.6,    # TP4056 USB-C board; bay fits boards up to 28 mm long  MEASURE
+    BRD_USB_H     = 3.4,   # USB-C receptacle height above the board
+    BRD_STANDOFF  = 1.2,   # gap under the boards for solder joints / wires
+    BAY_T         = 6.8,   # battery bay depth: cells up to 6.0 mm thick + swell + 0.6 mm TPU pad (thinner cells: thicker pad / foam)
+    BAY_W         = 26.0,  # battery bay width  (fits 20-25.5 mm wide cells)
+    BAY_L         = 36.5,  # battery bay length (fits 30-36 mm long cells)
+    BOX_DEPTH     = 7.4,   # inside depth of the controller box (battery bay + pad, or boards + USB-C)
+    TOP_BAND_SM   = 3.5,   # wire space above the battery
+    SW2_L         = 6.7, SW2_W = 2.6, SW2_H = 1.4,      # MSK-12C02 micro slide switch body             MEASURE
+    SW2_LEVER     = 1.5, SW2_TRAVEL = 1.5,              # lever length out of the body, slide travel
+    PX_W          = 10.4, PX_L = 16.9, PX_T = 2.1,      # 'single' LED: one pixel cut from a 10 mm strip (+clearance)
+    PX_MIX        = 3.0,   # light mixing gap between the pixel and the front diffuser
+    C5_ON_PLATE   = False, # 'floor' layout: True = LED box floor IS the clamp top plate (no stacked plate + floor);
+                            #   C5_H is then measured from the top pad, and the controller box top drops to match   # 'floor' layout: roof thickness
+    C5_LANE       = 1.2,   # 'floor' layout: wire lane behind the strip
+    C5_BACK_T     = 1.2,   # 'floor' layout: back wall
+    C60_FLOOR     = 1.0,   # LED box floor (it overhangs the 32 mm body)
+    CLAMP_W       = 60.0,  # clamp top plate width = LED box length (controller box stays 32 mm)
+    FINGER_W      = 12.0,  # front fingers sit at the two corners of the LED box
+    C60_WIN_H     = None,  # light window height (None = as tall as the strip allows: LS_W - 1.4)
+    C60_WIN_X     = 24.0,  # light window half-length (48 mm window + rounded ends)
+    C60_BACKER_T  = 1.0,   # wall the strip is stuck to
+    C60_DUCT      = 1.3,   # wire duct behind the backer wall
+    C60_END_GAP   = 2.0,   # gap at each end of the backer -> wires from the strip end into the duct
+    # ---- XIAO ESP32C3 (portrait, USB-C pointing DOWN) -----------------------
+    XIAO_L        = 21.0, XIAO_W = 17.8, XIAO_PCB_T = 1.0,     # MEASURE PCB_T
+    USB_W         = 8.94, USB_H = 3.2, USB_L = 7.35, USB_OVERHANG = 0.5,   # MEASURE
+    XIAO_STANDOFF = 1.2, XIAO_TOP_CLR = 0.6,
+    # ---- battery: 502535 (5 x 25 x 35 mm, 400 mAh) - keeps XIAO 380 mA charge <= 1C
+    BAT_L         = 35.0,  # along Z (incl. protection PCB)  MEASURE
+    BAT_W         = 25.0,  # along X                          MEASURE
+    BAT_T         = 5.0,   # MEASURE
+    BAT_SWELL     = 0.3, BAT_PAD_T = 0.6,
+    TOP_BAND      = 4.5,   # space above the battery where the LED wires turn
+    # ---- switch (MSK-12C02 type), on the right-hand side wall ---------------
+    SW_L          = 6.7, SW_W = 2.6, SW_H = 1.4, SW_ACT_W = 1.0, SW_ACT_L = 1.5, SW_TRAVEL = 1.5,  # MEASURE
+    # ---- electronics box ----------------------------------------------------
+    COVER_T       = 2.0,   # back cover (2 mm, stiff)
+    TAB_T         = 1.0,   # cover top tab that hooks under the box ledge
+    LEDGE_H       = 3.0,   # height of the box's top ledge (holds the cover tab)
+    SLIDE         = 1.6,   # cover drops in 1.6 mm low, then slides up under the ledge
+    TONGUE_D      = 1.0,   # depth of the cover side tongues / box side rabbets
+    CSK_RECESS    = 0.4,   # screw heads sit this far below the cover surface
+    ENC_R         = 3.0,   # bottom corner radius (rear view)
+    COL_R         = 2.2,
+    SCREW_CLR_D   = 2.4, SCREW_PILOT_D = 1.6, CSK_D = 4.0,
+    USB_RECESS    = 0.8,
+    # ---- branding (engraved on the back cover) ------------------------------
+    BRAND_LINES   = [],    # e.g. ["MY LAB", "AGENT DOT"] to engrave the cover; [] = plain
+    BRAND_SIZE    = 3.0, BRAND_DEPTH = 0.4, BRAND_X = 0.0, BRAND_FONT = '',
+)
+EXPORT_DIR = globals().get('EXPORT_DIR', None)
+
+# =============================================================================
+# GEOMETRY HELPERS
+# =============================================================================
+def box(x0, x1, y0, y1, z0, z1):
+    return Part.makeBox(x1 - x0, y1 - y0, z1 - z0, V(x0, y0, z0))
+
+
+def _map(axis):
+    # (a, b, c) -> 3D; c is the extrusion axis
+    if axis == 'y':
+        return lambda a, b, c: V(a, c, b)     # a=x, b=z
+    if axis == 'x':
+        return lambda a, b, c: V(c, a, b)     # a=y, b=z
+    return lambda a, b, c: V(a, b, c)         # a=x, b=y
+
+
+def rprism(a0, a1, b0, b1, c0, c1, r, axis):
+    """Rounded-rectangle prism. Corners rounded in the (a,b) plane, extruded along c."""
+    m = _map(axis)
+    r = min(r, (a1 - a0) / 2 - 1e-4, (b1 - b0) / 2 - 1e-4)
+    if r <= 0.01:
+        p = [m(a0, b0, c0), m(a1, b0, c0), m(a1, b1, c0), m(a0, b1, c0)]
+        f = Part.Face(Part.makePolygon(p + [p[0]]))
+    else:
+        e = []
+        def ln(p, q):
+            if (p - q).Length > 1e-6:
+                e.append(Part.LineSegment(p, q).toShape())
+        def arc(cx, cy, ang0):
+            pts = [m(cx + r * math.cos(math.radians(ang0 + d)),
+                     cy + r * math.sin(math.radians(ang0 + d)), c0) for d in (0, 45, 90)]
+            e.append(Part.Arc(*pts).toShape())
+        ln(m(a0 + r, b0, c0), m(a1 - r, b0, c0)); arc(a1 - r, b0 + r, -90)
+        ln(m(a1, b0 + r, c0), m(a1, b1 - r, c0)); arc(a1 - r, b1 - r, 0)
+        ln(m(a1 - r, b1, c0), m(a0 + r, b1, c0)); arc(a0 + r, b1 - r, 90)
+        ln(m(a0, b1 - r, c0), m(a0, b0 + r, c0)); arc(a0 + r, b0 + r, 180)
+        f = Part.Face(Part.Wire(Part.__sortEdges__(e)))
+    d = m(0, 0, c1 - c0) - m(0, 0, 0)
+    return f.extrude(d)
+
+
+def cyl(r, x, y, z, d, h):
+    return Part.makeCylinder(r, h, V(x, y, z), V(*d))
+
+
+def fillet(shape, r, pred):
+    """Fillet edges selected by predicate(edge); silently keeps shape if OCC fails."""
+    try:
+        edges = [e for e in shape.Edges if pred(e)]
+        if not edges:
+            return shape
+        s = shape.makeFillet(r, edges)
+        return s if s.isValid() else shape
+    except Exception:
+        return shape
+
+
+def near(v, t, tol=1e-3):
+    return abs(v - t) < tol
+
+
+def fuse(*shapes):
+    s = shapes[0]
+    for o in shapes[1:]:
+        s = s.fuse(o)
+    return s.removeSplitter()
+
+
+def cut(s, *tools):
+    for t in tools:
+        s = s.cut(t)
+    return s.removeSplitter()
+
+
+def _find_font(p):
+    if p.get('BRAND_FONT') and os.path.exists(p['BRAND_FONT']):
+        return p['BRAND_FONT']
+    import glob
+    roots = [os.path.dirname(os.path.dirname(App.getHomePath())), App.getHomePath(), '/usr/share/fonts',
+             '/Library/Fonts', '/System/Library/Fonts', 'C:/Windows/Fonts']
+    for r in roots:
+        for pat in ('**/DejaVuSans-Bold.ttf', '**/DejaVuSans.ttf', '**/Arial Bold.ttf', '**/arialbd.ttf'):
+            hits = glob.glob(os.path.join(r, pat), recursive=True)
+            if hits:
+                return hits[0]
+    return None
+
+
+def text_solid(txt, size, depth, p=None):
+    """Text in the XY plane, extruded +Z by depth+0.1, centred on the origin."""
+    font = _find_font(p or P)
+    if not font:
+        return None
+    faces = []
+    for ch in Part.makeWireString(txt, font, size, 0):
+        if ch:
+            try:
+                faces += Part.makeFace(ch, 'Part::FaceMakerBullseye').Faces
+            except Exception:
+                pass
+    if not faces:
+        return None
+    sh = Part.makeCompound(faces)
+    bb = sh.BoundBox
+    sh.translate(V(-bb.Center.x, -bb.Center.y, 0))
+    return sh.extrude(V(0, 0, depth + 0.1))
+
+
+def make_brand(p, L):
+    """Engraving tool: text on the cover's outer face, readable from behind the laptop."""
+    lines = p.get('BRAND_LINES') or []
+    font = _find_font(p) if lines else None
+    if not font:
+        return None
+    solids = []
+    lh = p['BRAND_SIZE'] * 1.55
+    for i, txt in enumerate(lines):
+        size = p['BRAND_SIZE'] * (1.0 if i == 0 else 0.8)
+        chars = Part.makeWireString(txt, font, size, 0)
+        faces = []
+        for ch in chars:
+            if ch:
+                try:
+                    faces += Part.makeFace(ch, 'Part::FaceMakerBullseye').Faces
+                except Exception:
+                    pass
+        if not faces:
+            continue
+        sh = Part.makeCompound(faces)
+        bb = sh.BoundBox
+        sh.translate(V(-bb.Center.x, -bb.Center.y + (len(lines) - 1) / 2 * lh - i * lh, 0))
+        solids.append(sh.extrude(V(0, 0, p['BRAND_DEPTH'] + 0.1)))
+    if not solids:
+        return None
+    t = Part.makeCompound(solids)
+    t.rotate(V(0, 0, 0), V(1, 0, 0), 90)     # XY text -> XZ plane, extruded toward -Y
+    t.rotate(V(0, 0, 0), V(0, 0, 1), 180)    # readable when viewed from +Y (behind the laptop)
+    zc = L['brand_z']
+    t.translate(V(p['BRAND_X'], L['ey2'] - p['BRAND_DEPTH'], zc))
+    return t
+
+
+def make_laptop(p, L):
+    """Dummy laptop lid for the mounted view only."""
+    lid = rprism(-160, 160, -210, 0, 0, p['LAPTOP_T'], 4, 'y')
+    lid = fillet(lid, min(1.5, p['LAPTOP_T'] / 2 - 0.1),
+                 lambda e: near(e.BoundBox.ZMax, 0) and near(e.BoundBox.ZMin, 0) and e.BoundBox.XLength > 100)
+    screen = box(-150, 150, -0.05, 0.0, -200, -8)
+    cam = cyl(1.2, 0, -0.06, -4.5, (0, 1, 0), 0.06)
+    return lid, screen, cam
+
+
+def to_bed(shape, rot):
+    s = shape.copy()
+    if rot:
+        s.rotate(V(0, 0, 0), rot[0], rot[1])
+    try:
+        bb = s.optimalBoundingBox()
+    except Exception:
+        bb = s.BoundBox
+    s.translate(V(-bb.Center.x, -bb.Center.y, -bb.ZMin))
+    return s
+
+
+
+# =============================================================================
+# LAYOUT (all stack-up maths)
+# =============================================================================
+def layout(p):
+    L = {}
+    pad = p['PAD_T']
+    L['x_half'] = h = p['W'] / 2
+    # --- clip ---
+    L['G'] = p['LAPTOP_T'] + 2 * pad - p['SQUEEZE']
+    L['y_lip_in'] = -pad
+    L['y_lip_out'] = -pad - p['LIP_T']
+    L['y_rp0'] = L['y_lip_in'] + L['G']
+    L['y_jaw1'] = L['y_rp0'] + p['RP_T']          # back of the LED unit's rear jaw
+    L['y_rp1'] = L['y_jaw1']                      # inside face of the box front wall (same slab as the jaw)
+    L['z_top0'] = pad
+    L['z_top1'] = pad + p['TOP_T']
+    # --- LED cap (Y stack from the front) ---
+    y = L['y_lip_out']; L['y_h0'] = y
+    y += p['FW_T'];                       L['y_fw1'] = y
+    y += p['STRIP_T'] + p['STRIP_CLR'];   L['y_fl1'] = y
+    y += p['MIX_GAP'];                    L['y_led0'] = y
+    y += p['LED_HT'];                     L['y_pcb0'] = y
+    y += p['LED_PCB_T'];                  L['y_pcb1'] = y
+    L['y_h1'] = L['y_rp0'] + p['LEDBOX_REAR']    # LED box depth unchanged
+    if p.get('LED_LAYOUT') == 'floor':           # flat strip needs the strip width + a wire lane
+        L['y_h1'] = L['y_h0'] + p['FW_T'] + p['STRIP_T'] + p['STRIP_CLR'] + 0.4 + p['LS_W'] + 0.4 + p['C5_LANE'] + p['C5_BACK_T']
+    if p.get('LED_LAYOUT') == 'single':          # one pixel at the back
+        L['y_h1'] = L['y_h0'] + p['FW_T'] + p['STRIP_T'] + p['STRIP_CLR'] + 0.4 + p['PX_MIX'] + p['PX_W'] + 0.4 + p['C5_BACK_T']
+    L['y_cb0'] = L['y_h1'] - 0.8                 # cap back wall
+    L['y_dowel'] = (L['y_h0'] + L['y_h1']) / 2
+    L['z_h0'] = L['z_top1']
+    L['z_int1'] = L['z_h0'] + p['LED_PCB_H'] + p['CLR']
+    L['z_h1'] = L['z_int1'] + p['H_ROOF']
+    L['z_led'] = L['z_h0'] + p['LED_PCB_H'] / 2
+    L['x_hint'] = h - p['H_END']
+    L['x_win'] = p['LED_PCB_L'] / 2 + 0.1
+    # --- electronics box (portrait) ---
+    L['int_y'] = max(p['XIAO_STANDOFF'] + p['XIAO_PCB_T'] + p['USB_H'] + p['XIAO_TOP_CLR'],
+                     p['BAT_T'] + p['BAT_SWELL'] + p['BAT_PAD_T'] + 0.1)
+    L['ex0'], L['ex1'] = -h, h
+    L['int_x0'], L['int_x1'] = -h + p['WALL'], h - p['WALL']
+    L['ey0'] = L['y_rp0']; L['iy0'] = L['y_rp1']      # slim 1.6 mm front wall; the jaw fills it at the top
+    L['ey1'] = L['iy0'] + L['int_y']; L['ey2'] = L['ey1'] + p['COVER_T']
+    L['ez1'] = L['z_top0'] if (p.get('LED_LAYOUT') in ('floor', 'single') and p.get('C5_ON_PLATE')) else L['z_top1']; L['iz1'] = L['ez1'] - p['WALL']        # box top flush with the clip top
+    # wire channel: down through the clip top + inside face of the front wall into the box
+    L['ww_z1'] = L['z_top1']; L['ww_z0'] = L['iz1'] - p['TOP_BAND']
+    # battery
+    L['bat_x0'], L['bat_x1'] = -p['BAT_W'] / 2, p['BAT_W'] / 2
+    L['bat_z1'] = L['iz1'] - p['TOP_BAND']; L['bat_z0'] = L['bat_z1'] - p['BAT_L']
+    L['bat_y0'] = L['iy0']; L['bat_y1'] = L['iy0'] + p['BAT_T']
+    # middle screw columns (between battery and XIAO)
+    zc_mid = L['bat_z0'] - p['CLR'] - p['COL_R'] - 0.2
+    # XIAO, USB-C down
+    L['bz1'] = zc_mid - p['COL_R'] - 0.4; L['bz0'] = L['bz1'] - p['XIAO_L']
+    L['bx0'], L['bx1'] = -p['XIAO_W'] / 2, p['XIAO_W'] / 2
+    L['by0'] = L['iy0'] + p['XIAO_STANDOFF']; L['by1'] = L['by0'] + p['XIAO_PCB_T']
+    L['usb_z0'] = L['bz0'] - p['USB_OVERHANG']
+    L['usb_y1'] = L['by1'] + p['USB_H']
+    L['iz0'] = L['usb_z0'] - p['CLR']; L['ez0'] = L['iz0'] - p['WALL']
+    xc = L['int_x1'] - p['COL_R'] - 0.2
+    xm = L['int_x1'] - 1.4      # middle posts merge into the side walls (no floating cantilever when printed)
+    L['cols'] = [(-xm, zc_mid), (xm, zc_mid), (-xc, L['iz0'] + p['COL_R'] + 0.6), (xc, L['iz0'] + p['COL_R'] + 0.6)]
+    # switch on the +X side wall, beside the XIAO
+    L['sw_x1'] = L['int_x1']; L['sw_x0'] = L['sw_x1'] - p['SW_W']
+    L['sw_z1'] = L['bz1'] - 1.0; L['sw_z0'] = L['sw_z1'] - p['SW_L']
+    L['sw_y0'] = L['iy0']; L['sw_y1'] = L['iy0'] + p['SW_H']
+    L['rp_z0'] = L['ez0'] + 1.0
+    L['screw_top'] = L['ey2'] - p['CSK_RECESS']
+    L['screw_len'] = 6.0                          # cover screws only (M2x6 csk into the body posts)
+    L['screw_tip'] = L['screw_top'] - 6.0
+    L['brand_z'] = (L['bat_z0'] + L['bat_z1']) / 2
+    L['tab_hw'] = L['int_x1'] - 1.5
+    L['jb_z0'] = L['bat_z1'] + 0.3                      # joint screw blocks: in the top band, above the battery
+    L['z_joint'] = L['z_top0'] - p['CSK_D'] / 2 - 0.3      # head stays under the clamp top plate
+    L['rib_z1'] = p['JAW_Z0'] - 0.15                   # lid-bearing ribs below the jaw
+    return L
+
+
+# =============================================================================
+# PARTS
+# =============================================================================
+def front_rounded(x0, x1, y0, y1, z0, z1, r):
+    """Box with only its two FRONT (min-Y) vertical edges rounded (top view)."""
+    s = rprism(x0, x1, y0, y1 + 2 * r, z0, z1, r, 'z')
+    return s.common(box(x0 - 1, x1 + 1, y0 - 1, y1, z0 - 1, z1 + 1)).removeSplitter()
+
+
+def make_led_housing(p, L):
+    """LED cap: light bar at the front, wire space behind, wire window in its back wall."""
+    h = L['x_half']
+    outer = front_rounded(-h, h, L['y_h0'], L['y_h1'], L['z_h0'], L['z_h1'], p['PLAN_R'])
+    outer = fillet(outer, 1.2, lambda e: near(e.BoundBox.ZMin, L['z_h1']) and near(e.BoundBox.ZMax, L['z_h1']))
+    xi = L['x_hint']
+    cav = box(-xi, xi, L['y_fw1'], L['y_cb0'], L['z_h0'] - 0.1, L['z_int1'])
+    win = rprism(-L['x_win'] - 0.3, L['x_win'] + 0.3, L['z_led'] - p['WIN_H'] / 2, L['z_led'] + p['WIN_H'] / 2,
+                 L['y_h0'] - 0.1, L['y_fw1'] + 0.1, p['WIN_H'] / 2, 'y')
+    slot = box(-L['x_win'], L['x_win'], L['y_pcb0'] - 0.1, L['y_pcb1'] + 0.1, L['z_int1'] - 0.1, L['z_int1'] + 0.4)
+    strip_slot = box(xi - 0.1, h + 0.1, L['y_fw1'], L['y_fl1'], L['z_h0'] - 0.1, L['z_h0'] + p['STRIP_H'] + 0.15)
+    s = cut(outer, cav, win, slot, strip_slot)
+    ribs = [box(-xi, -xi + 0.4, L['y_fl1'], L['y_pcb0'], L['z_h0'], L['z_int1']),
+            box(xi - 0.4, xi, L['y_fl1'], L['y_pcb0'], L['z_h0'], L['z_int1']),
+            box(-xi, xi, L['y_fl1'], L['y_fl1'] + p['RAIL_T'], L['z_int1'] - 0.8, L['z_int1']),
+            box(-xi + 0.4, xi - 0.4, L['y_fl1'], L['y_fl1'] + p['RAIL_T'], L['z_h0'], L['z_h0'] + 0.6)]   # bottom strip rail
+    # stiffening: two full-height webs behind the LED PCB tie the roof to the clip bridge
+    # (outside the 10 mm wire groove), plus 1 mm fillets where the roof meets the walls
+    for sx in (-1, 1):
+        ribs.append(box(sx * 9.0 - 0.6, sx * 9.0 + 0.6, L['y_pcb1'] + 1.0, L['y_cb0'] + 0.01, L['z_h0'], L['z_int1']))
+    s = fuse(s, *ribs)
+    s = fillet(s, 0.8, lambda e: near(e.BoundBox.ZMin, L['z_int1']) and near(e.BoundBox.ZMax, L['z_int1'])
+               and (near(e.BoundBox.XMin, xi) or near(e.BoundBox.XMax, -xi)) and e.BoundBox.YLength > 3)
+    for sx in (-1, 1):
+        s = cut(s, cyl(p['DOWEL_D'] / 2, sx * (h - p['H_END'] / 2), L['y_dowel'], L['z_h0'] - 0.1, (0, 0, 1), 2.6))
+    return s
+
+
+def c5_layout(p, L):
+    """5 mm low-profile LED box: strip flat on the floor (LEDs up), reflector roof, diffuser in the FRONT."""
+    C = {}
+    C['x_half'] = p['C60_L'] / 2
+    C['x_int'] = C['x_half'] - p['H_END']
+    if p.get('C5_ON_PLATE'):      # floor = clamp top plate, sitting right on the top pad
+        C['z0'] = L['z_top0']; C['zf'] = L['z_top1']
+    else:
+        C['z0'] = L['z_top1']; C['zf'] = C['z0'] + p['C5_FLOOR']
+    C['z1'] = C['z0'] + p['C5_H']
+    C['zi1'] = C['z1'] - p['C5_ROOF']
+    C['y_fw1'] = L['y_h0'] + p['FW_T']
+    C['y_fl1'] = C['y_fw1'] + p['STRIP_T'] + p['STRIP_CLR']                   # front diffuser slot
+    if p.get('LED_LAYOUT') == 'single':       # ONE pixel lying flat at the BACK of the box, light mixed forward
+        C['y_s0'] = C['y_fl1'] + 0.4 + p['PX_MIX']; C['y_s1'] = C['y_s0'] + p['PX_W']
+        C['y_lane0'] = C['y_s1']; C['y_cb0'] = C['y_s1'] + 0.4
+    else:
+        C['y_s0'] = C['y_fl1'] + 0.4; C['y_s1'] = C['y_s0'] + p['LS_W']          # strip footprint (behind the diffuser rails)
+        C['y_lane0'] = C['y_s1'] + 0.4; C['y_cb0'] = C['y_lane0'] + p['C5_LANE']  # wire lane, back wall inside
+    C['z_fpc1'] = C['zf'] + p['LS_FPC_T']; C['z_led1'] = C['z_fpc1'] + p['LS_LED_H']
+    C['z_refl0'] = C['z_led1'] + 0.4                                         # reflector: from roof (front) down to here (back)
+    C['ls_len'] = p['PX_L'] if p.get('LED_LAYOUT') == 'single' else p['LS_N'] * p['LS_PITCH']
+    C['x_win'] = p['C60_WIN_X']; C['x_bk'] = C['x_int'] - p['C60_END_GAP']
+    C['win_h'] = C['zi1'] - C['zf'] - 0.8
+    C['z_led'] = (C['zf'] + C['zi1']) / 2
+    C['y_duct0'] = C['y_lane0']      # (the lane plays the duct's role)
+    return C
+
+
+def c60_layout(p, L):
+    """Geometry for the 60 mm strip cap (same body, same dowels, same wire channel)."""
+    if p.get('LED_LAYOUT') in ('floor', 'single'):
+        return c5_layout(p, L)
+    C = {}
+    C['x_half'] = p['C60_L'] / 2
+    C['x_int'] = C['x_half'] - p['H_END']
+    C['z0'] = L['z_top1']; C['zf'] = C['z0'] + p['C60_FLOOR']
+    C['zi1'] = C['zf'] + p['LS_W'] + 0.4; C['z1'] = C['zi1'] + p['H_ROOF']
+    C['z_led'] = C['zf'] + 0.2 + p['LS_W'] / 2
+    C['y_fw1'] = L['y_h0'] + p['FW_T']
+    C['y_fl1'] = C['y_fw1'] + p['STRIP_T'] + p['STRIP_CLR']
+    C['y_cb0'] = L['y_h1'] - 0.8                              # back wall
+    C['y_duct0'] = C['y_cb0'] - p['C60_DUCT']                 # wire duct behind the backer
+    C['y_bk1'] = C['y_duct0']; C['y_bk0'] = C['y_bk1'] - p['C60_BACKER_T']   # backer wall
+    C['y_fpc0'] = C['y_bk0'] - p['LS_FPC_T']                 # strip front (LED base)
+    C['y_led0'] = C['y_fpc0'] - p['LS_LED_H']                # LED emitting face
+    C['x_bk'] = C['x_int'] - p['C60_END_GAP']
+    C['ls_len'] = p['LS_N'] * p['LS_PITCH']
+    C['x_win'] = p['C60_WIN_X']
+    C['win_h'] = p['C60_WIN_H'] or (p['LS_W'] - 1.4)
+    C['y_scr'] = C['y_fl1'] + 2.35                            # corner screws: in front of the strip, behind the frame
+    return C
+
+
+def make_led_housing_5(p, L):
+    """5 mm tall LED box. Strip lies flat on the floor, LEDs up. The roof's inside is a slope (a reflector,
+    lowest at the back) that turns the light forward through a 1 mm diffuser standing in the front, which
+    slides in from the right end like the standard box. Wires leave the strip END, fold back into the lane
+    behind the strip and drop through the floor slot into the controller box. The strip slides in from the
+    right end too (end plug closes it). Print the LED unit in WHITE (or line the slope with white tape)."""
+    C = c5_layout(p, L)
+    h, xi = C['x_half'], C['x_int']
+    outer = rprism(-h, h, L['y_h0'], L['y_h1'], C['z0'], C['z1'], p['PLAN_R'], 'z')
+    outer = fillet(outer, 1.0, lambda e: near(e.BoundBox.ZMin, C['z1']) and near(e.BoundBox.ZMax, C['z1']))
+    cav = box(-xi, xi, C['y_fw1'], C['y_cb0'], C['zf'], C['zi1'])
+    zc, wh = C['z_led'], C['win_h']
+    win = rprism(-C['x_win'], C['x_win'], zc - wh / 2, zc + wh / 2, L['y_h0'] - 0.1, C['y_fw1'] + 0.1, wh / 2 - 0.01, 'y')
+    dslot = box(xi - 0.1, h + 0.1, C['y_fw1'], C['y_fl1'], C['zf'] - 0.05, C['zi1'] + 0.05)          # diffuser entry (right end)
+    sslot = box(xi - 0.1, h + 0.1, C['y_s0'] - 0.1, C['y_cb0'], C['zf'] - 0.05, C['z_refl0'] - 0.05)  # strip entry (right end)
+    ww = p['WIRE_WIN_W'] / 2
+    single = p.get('LED_LAYOUT') == 'single'
+    if single:   # big wire hole right beside the pixel's (right) end, straight down into the controller box
+        wy0, wy1 = wire_hole_y(p, L, C)
+        floor_slot = box(p['PX_L'] / 2 + 0.6, xi - 0.6, wy0, wy1, C['z0'] - 0.1, C['zf'] + 0.1)
+    else:
+        floor_slot = box(-ww, ww, C['y_lane0'] + 0.05, C['y_cb0'], C['z0'] - 0.1, C['zf'] + 0.1)
+    s = cut(outer, cav, win, dslot, sslot, floor_slot)
+    f = [box(-xi, xi, C['y_fl1'], C['y_fl1'] + 0.4, C['zf'] - 0.01, C['zf'] + 0.5),                 # diffuser rails (back side)
+         box(-xi, xi, C['y_fl1'], C['y_fl1'] + 0.4, C['zi1'] - 0.5, C['zi1'] + 0.01)]
+    if single:   # stop: the pixel slides in from the right end until it sits centred
+        f.append(box(-p['PX_L'] / 2 - 1.2, -p['PX_L'] / 2, C['y_s0'], C['y_s1'], C['zf'] - 0.01, C['zf'] + 0.8))
+    else:
+        f.append(box(-C['x_bk'] + 1, C['x_bk'] - 1, C['y_s1'] + 0.05, C['y_lane0'], C['zf'] - 0.01, C['zf'] + 0.8))   # strip / lane rib
+    pts = [V(-xi, C['y_fl1'] + 0.4, C['zi1'] + 0.01), V(-xi, C['y_cb0'] + 0.01, C['zi1'] + 0.01),
+           V(-xi, C['y_cb0'] + 0.01, C['z_refl0']), V(-xi, C['y_fl1'] + 0.4, C['zi1'] + 0.01)]
+    f.append(Part.Face(Part.makePolygon(pts)).extrude(V(2 * xi, 0, 0)))                            # reflector slope
+    return fuse(s, *f)
+
+
+def wire_hole_y(p, L, C):
+    """Y range of the single-pixel wire hole: over the controller box's inside, as wide as possible."""
+    return max(C['y_s0'], L['iy0'] + 0.5), min(C['y_cb0'], L['ey1'] - 0.6)
+
+
+def make_led_housing_60(p, L):
+    """60 mm LED cap for a 12 mm RGB strip. Closed box with a floor (it overhangs the body);
+    strip sticks to an internal backer wall; wires leave the strip END, pass round the backer
+    through the end gap, run along the duct behind it and drop through the floor slot into the
+    body's wire channel. Printed lying on its back (no bridges over the strip cavity)."""
+    C = c60_layout(p, L)
+    h, xi = C['x_half'], C['x_int']
+    outer = rprism(-h, h, L['y_h0'], L['y_h1'], C['z0'], C['z1'], p['PLAN_R'], 'z')
+    outer = fillet(outer, 1.5, lambda e: near(e.BoundBox.ZMin, C['z1']) and near(e.BoundBox.ZMax, C['z1']))
+    cav = box(-xi, xi, C['y_fw1'], C['y_cb0'], C['zf'], C['zi1'])
+    win = rprism(-C['x_win'], C['x_win'], C['z_led'] - C['win_h'] / 2, C['z_led'] + C['win_h'] / 2,
+                 L['y_h0'] - 0.1, C['y_fw1'] + 0.1, C['win_h'] / 2, 'y')
+    slot = box(xi - 0.1, h + 0.1, C['y_fw1'], C['y_fl1'], C['zf'] - 0.05, C['zi1'] + 0.05)   # diffuser entry (right end)
+    sslot = box(xi - 0.1, h + 0.1, C['y_led0'] - 0.3, C['y_bk0'], C['zf'] - 0.05, C['zi1'] + 0.05)   # LED strip entry (right end)
+    ww = p['WIRE_WIN_W'] / 2
+    floor_slot = box(-ww, ww, C['y_duct0'] + 0.05, C['y_cb0'], C['z0'] - 0.1, C['zf'] + 0.1)  # into the body channel
+    s = cut(outer, cav, win, slot, sslot, floor_slot)
+    f = [box(-xi, xi, C['y_fl1'], C['y_fl1'] + p['RAIL_T'], C['zi1'] - 0.8, C['zi1']),          # diffuser rails
+         box(-xi, xi, C['y_fl1'], C['y_fl1'] + p['RAIL_T'], C['zf'], C['zf'] + 0.8),
+         box(-C['x_bk'], C['x_bk'], C['y_bk0'], C['y_bk1'], C['zf'], C['zi1'])]                 # backer wall
+    for sx in (-1, 1):
+        f.append(box(sx * xi - (0.6 if sx > 0 else 0), sx * xi + (0 if sx > 0 else 0.6),
+                     C['y_fl1'], C['y_fl1'] + 1.0, C['zf'], C['zi1']))                             # strip end stops
+    return fuse(s, *f)
+
+
+def jaw_profile(p, L, x0, x1, off):
+    """Rear jaw, YZ section: full height at the lid side, 45 deg bottom rising to the back.
+    The controller box has the matching 45 deg seat, so its front face is flush with the jaw."""
+    z0, y0, y1, zt = p['JAW_Z0'] - off, L['y_rp0'] - 1.0 * (off > 0), L['y_jaw1'] + off, L['z_top1'] + 1.0 * (off > 0)
+    d = L['y_jaw1'] - L['y_rp0']
+    pts = [V(x0, y0, zt), V(x0, y0, z0 - (L['y_rp0'] - y0)), V(x0, L['y_rp0'], z0), V(x0, y1, z0 + d + (y1 - L['y_jaw1'])),
+           V(x0, y1, zt), V(x0, y0, zt)]
+    return Part.Face(Part.makePolygon(pts)).extrude(V(x1 - x0, 0, 0))
+
+
+def make_end_plug(p, L):
+    """Small plug that closes the LED-strip entry slot in the right end of the LED box."""
+    C = c60_layout(p, L)
+    h, xi = C['x_half'], C['x_int']
+    if p.get('LED_LAYOUT') in ('floor', 'single'):
+        return box(xi + 0.1, h, C['y_s0'], C['y_cb0'] - 0.1, C['zf'] + 0.1, C['z_refl0'] - 0.15)
+    plug = box(xi + 0.1, h, C['y_led0'] - 0.3 + 0.1, C['y_bk0'] - 0.1, C['zf'] + 0.1, C['zi1'] - 0.1)
+    return plug
+
+
+def make_led_unit(p, L):
+    """LED unit = 60 mm LED box + the whole lid clamp (top plate, corner fingers, rear jaw), ONE print.
+    It clips onto the lid on its own; the controller box screws to the back of the jaw."""
+    hc = p['C60_L'] / 2
+    cap = make_led_housing_5(p, L) if p.get('LED_LAYOUT') in ('floor', 'single') else make_led_housing_60(p, L)
+    lips = [box(sx * hc - (p['FINGER_W'] if sx > 0 else 0), sx * hc + (0 if sx > 0 else p['FINGER_W']),
+                L['y_lip_out'], L['y_lip_in'], -p['LIP_H'], L['z_top1']) for sx in (-1, 1)]
+    top = box(-hc, hc, L['y_lip_out'], L['y_jaw1'], L['z_top0'], L['z_top1'] + (0.0 if p.get('C5_ON_PLATE') and p.get('LED_LAYOUT') in ('floor', 'single') else 0.01))
+    jaw = jaw_profile(p, L, -hc, hc, 0.0)
+    clamp = fuse(top, jaw, *lips).common(rprism(-hc, hc, L['y_lip_out'], L['y_jaw1'], -100, 50, p['PLAN_R'], 'z'))
+    s = fuse(cap, clamp)
+    ww = p['WIRE_WIN_W'] / 2
+    C = c60_layout(p, L)
+    tools = [] if p.get('LED_LAYOUT') in ('floor', 'single') else \
+        [box(-ww, ww, C['y_duct0'] + 0.05, L['y_jaw1'] + 0.05, L['iz1'] - 0.5, L['z_top1'] + 0.1)]   # wire drop notch
+    dcs = (p['CSK_D'] - p['SCREW_CLR_D']) / 2
+    for sx in ((-1, 1) if not p.get('ONE_PIECE') else ()):   # joint screws: countersunk in the jaw's lid-facing side
+        xj = sx * p['JOINT_X']
+        tools.append(cyl(p['SCREW_CLR_D'] / 2, xj, L['y_rp0'] - 0.1, L['z_joint'], (0, 1, 0), p['RP_T'] + 0.2))
+        tools.append(Part.makeCone(p['CSK_D'] / 2 + 0.1, p['SCREW_CLR_D'] / 2, dcs + 0.1, V(xj, L['y_rp0'] - 0.1, L['z_joint']), V(0, 1, 0)))
+    lab = text_solid('%.1f' % p['LAPTOP_T'], 4.0, 0.5, p) if not p.get('ONE_PIECE') else None
+    if lab is not None:      # lid-size label on the jaw's lid-facing side (under the rear pad)
+        lab = lab.transformGeometry(App.Matrix(1, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, 0, 0, 1))
+        bb = lab.BoundBox
+        lab.translate(V(-22 - bb.Center.x, L['y_rp0'] + 0.4 - bb.YMax, (p['JAW_Z0'] + L['z_top0']) / 2 - bb.Center.z))
+        tools.append(lab)
+    return cut(s, *tools)
+
+
+def strip_dims(p, L):
+    if p['LED_VARIANT'] == 'strip60':
+        C = c60_layout(p, L)
+        return C['x_int'] + C['x_half'], C['zi1'] - C['zf'] - 0.2, p['STRIP_T']
+    return L['x_hint'] + L['x_half'], p['STRIP_H'], p['STRIP_T']
+
+
+def make_strip(p, L):
+    ln, ht, th = strip_dims(p, L)
+    if p['LED_VARIANT'] == 'strip60':
+        C = c60_layout(p, L)
+        return box(-C['x_int'], -C['x_int'] + ln, C['y_fw1'], C['y_fw1'] + th, C['zf'], C['zf'] + ht)
+    return box(-L['x_hint'], -L['x_hint'] + ln, L['y_fw1'], L['y_fw1'] + th, L['z_h0'], L['z_h0'] + ht)
+
+
+def clamp_half(p, L):
+    """Half-width of the clamp top plate: as wide as the LED box (60 mm) for the strip box."""
+    return p['CLAMP_W'] / 2 if p['LED_VARIANT'] == 'strip60' else L['x_half']
+
+
+def box_outline(p, L, y0, y1):
+    """Portrait box outline: square top (flush with the clip top), rounded bottom corners."""
+    s = rprism(L['ex0'], L['ex1'], L['ez0'], L['ez1'], y0, y1, p['ENC_R'], 'y')
+    return s.fuse(box(L['ex0'], L['ex1'], y0, y1, L['ez1'] - p['ENC_R'] - 1, L['ez1'])).removeSplitter()
+
+
+def usb_cuts(p, L):
+    hw = p['USB_W'] / 2 + 0.35
+    t = [box(-hw, hw, L['by1'] - 0.35, L['ey1'] + 0.05, L['ez0'] - 0.1, L['iz0'] + 0.1)]
+    ryc = L['by1'] + p['USB_H'] / 2
+    t.append(rprism(-6.3, 6.3, ryc - 3.5, ryc + 3.5, L['ez0'] - 0.1, L['ez0'] + p['USB_RECESS'], 1.5, 'z'))
+    return t
+
+
+def make_body(p, L):
+    """ONE printed part: clip (finger + top bridge + rear plate) and the electronics box.
+    The clip rear plate is also the box front wall. Printed upside down on its flat top."""
+    # flush front: the box runs right up to the lid pad; the jaw drops into a 45 deg seat at its top
+    s = cut(box_outline(p, L, L['y_rp0'], L['ey1']), jaw_profile(p, L, -50, 50, p['CLR']))
+    s = cut(s, rprism(L['int_x0'], L['int_x1'], L['iz0'], L['iz1'], L['iy0'], L['ey1'] + 0.1, 1.2, 'y'))
+    s = cut(s, box(-50, 50, L['y_rp1'], L['ey1'] + 1, L['ez0'] - 1, L['iz0']))   # no bottom wall: the cover's flange closes it
+    f = []
+    iy0 = L['iy0']
+
+    def gusset(x0, x1, ytip, ztop):
+        """45 deg wedge above a feature's +Z face (that face points DOWN when the body prints upside down)"""
+        d = ytip - iy0
+        pts = [V(x0, iy0 - 0.01, ztop - 0.01), V(x0, ytip, ztop - 0.01), V(x0, iy0 - 0.01, ztop + d), V(x0, iy0 - 0.01, ztop - 0.01)]
+        return Part.Face(Part.makePolygon(pts)).extrude(V(x1 - x0, 0, 0))
+
+    for k, (x, z) in enumerate(L['cols']):   # screw posts
+        if k < 2:   # middle posts: wall-attached, 45 deg top face toward the battery
+            sx = 1 if x > 0 else -1
+            w = L['int_x1']
+            xs = [sx * w, sx * (w - 3.6), sx * (w - 3.6), sx * w]
+            zs = [z - 2.2, z - 2.2, z - 0.4, z - 0.4 + 3.6]
+            pts = [V(xs[i], iy0 - 0.01, zs[i]) for i in range(4)] + [V(xs[0], iy0 - 0.01, zs[0])]
+            f.append(Part.Face(Part.makePolygon(pts)).extrude(V(0, L['int_y'] + 0.01, 0)))
+            continue
+        f.append(cyl(p['COL_R'], x, L['iy0'] - 0.01, z, (0, 1, 0), L['int_y'] + 0.01))
+        d = p['COL_R'] * 1.414
+        fin = box(-d / 1.414, d / 1.414, L['iy0'] - 0.01, L['ey1'], -d / 1.414, d / 1.414)
+        fin.rotate(V(0, 0, 0), V(0, 1, 0), 45); fin.translate(V(x, 0, z))
+        f.append(fin.common(box(x - 5, x + 5, L['iy0'] - 0.02, L['ey1'], z, z + 5)))
+    for x0 in (L['bx0'], L['bx1'] - 2.0):
+        for z0 in (L['bz0'], L['bz1'] - 1.2):
+            f.append(box(x0, x0 + 2.0, L['iy0'] - 0.01, L['by0'], z0, z0 + 1.2))
+    for x0 in (-6.0, 5.0):
+        f.append(box(x0, x0 + 1.0, L['iy0'] - 0.01, L['by1'] + 0.5, L['bz1'] + p['CLR'], L['bz1'] + 0.8))
+    zc = (L['bz0'] + L['bz1']) / 2 - 3
+    f.append(box(L['bx0'] - 0.8, L['bx0'] - p['CLR'], L['iy0'] - 0.01, L['by1'] + 0.5, zc - 1.5, zc + 1.5))
+    f.append(box(L['bx1'] + p['CLR'], L['bx1'] + 0.8, L['iy0'] - 0.01, L['by1'] + 0.5, zc - 1.5, zc + 1.5))
+    f.append(box(L['sw_x0'] - p['CLR'], L['int_x1'] + 0.01, L['iy0'] - 0.01, L['sw_y1'] + 0.5, L['sw_z1'] + p['CLR'], L['sw_z1'] + p['CLR'] + 0.6))
+    zt = L['sw_z0'] - p['CLR']; tip = L['sw_y1'] + 0.5 - iy0      # lower switch stop: 45 deg wedge
+    pts = [V(L['sw_x0'] - p['CLR'], iy0 - 0.01, zt), V(L['sw_x0'] - p['CLR'], iy0 - 0.01, zt - tip - 0.8),
+           V(L['sw_x0'] - p['CLR'], iy0 + tip, zt - tip - 0.8), V(L['sw_x0'] - p['CLR'], iy0 + tip, zt - tip), V(L['sw_x0'] - p['CLR'], iy0 - 0.01, zt)]
+    f.append(Part.Face(Part.makePolygon(pts)).extrude(V(L['int_x1'] + 0.01 - L['sw_x0'] + p['CLR'], 0, 0)))
+    for x0 in (L['bat_x0'] - p['CLR'] - 0.6, L['bat_x1'] + p['CLR']):
+        f.append(box(x0, x0 + 0.6, L['iy0'] - 0.01, L['iy0'] + 2.5, L['bat_z0'] + 3, L['bat_z1'] - 5.5))
+    for x0 in (-10.4, 6.0):   # battery top stops (tied into the joint blocks)
+        f.append(box(x0, x0 + 4.4, L['iy0'] - 0.01, L['iy0'] + 1.5, L['bat_z1'] + p['CLR'], L['bat_z1'] + 0.8))
+    for sx in (-1, 1):   # joint screw blocks, hung from the top + side walls (behind the jaw)
+        x0, x1 = sorted([sx * (L['int_x1'] - 5.5), sx * (L['int_x1'] + 0.01)])
+        f.append(box(x0, x1, L['iy0'] + p['CLR'], L['iy0'] + 4.5, L['jb_z0'], L['iz1'] + 0.01))
+    # 45 deg gussets on every small ledge so nothing starts in mid-air in the upside-down print
+    G = []
+    for x0 in (L['bx0'], L['bx1'] - 2.0):
+        G.append(gusset(x0, x0 + 2.0, L['by0'], L['bz1']))                      # board top-corner ledges
+        G.append(gusset(x0, x0 + 2.0, L['by0'], L['bz0'] + 1.2))                # board bottom-corner ledges
+    for x0 in (-6.0, 5.0):
+        G.append(gusset(x0, x0 + 1.0, L['by1'] + 0.5, L['bz1'] + 0.8))          # top-edge locators
+    zc = (L['bz0'] + L['bz1']) / 2 - 3
+    G.append(gusset(L['bx0'] - 0.8, L['bx0'] - p['CLR'], L['by1'] + 0.5, zc + 1.5))
+    G.append(gusset(L['bx1'] + p['CLR'], L['bx1'] + 0.8, L['by1'] + 0.5, zc + 1.5))
+    G.append(gusset(L['sw_x0'] - p['CLR'], L['int_x1'] + 0.01, L['sw_y1'] + 0.5, L['sw_z1'] + p['CLR'] + 0.6))
+    for x0 in (L['bat_x0'] - p['CLR'] - 0.6, L['bat_x1'] + p['CLR']):
+        G.append(gusset(x0, x0 + 0.6, L['iy0'] + 2.5, L['bat_z1'] - 5.5))
+    for x0 in (-10.4, 6.0):
+        G.append(gusset(x0, x0 + 4.4, L['iy0'] + 1.5, L['bat_z1'] + 0.8))
+    f += G
+    s = fuse(s, *f)
+    s = cut(s, jaw_profile(p, L, -50, 50, p['CLR']))     # keep every feature clear of the jaw
+    tools = []
+    for x, z in L['cols']:   # thread-forming pilots for the M2x6 cover screws
+        tools.append(cyl(p['SCREW_PILOT_D'] / 2, x, L['ey1'] - 5.0, z, (0, 1, 0), 5.1))
+    ww = p['WIRE_WIN_W'] / 2
+    tools.append(box(-ww, ww, L['y_rp1'] - 0.5, min(L['y_cb0'], L['ey1'] - 0.3), L['iz1'] - 0.1, L['z_top1'] + 0.1))   # wire slot in the box top (under the LED duct)
+    for sx in (-1, 1):   # pilots in the joint blocks
+        tools.append(cyl(p['SCREW_PILOT_D'] / 2, sx * p['JOINT_X'], L['iy0'] - 0.3, L['z_joint'], (0, 1, 0), 4.7))
+    sl = (p['SW_ACT_W'] + p['SW_TRAVEL']) / 2 + 0.3
+    zc = (L['sw_z0'] + L['sw_z1']) / 2; yc = (L['sw_y0'] + L['sw_y1']) / 2
+    tools.append(box(L['int_x1'] - 0.1, L['ex1'] + 0.1, yc - 0.7, yc + 0.7, zc - sl, zc + sl))   # switch window (closed)
+    for sx in (-1, 1):
+        x0, x1 = sorted([sx * L['int_x1'], sx * (L['int_x1'] + 0.8)])
+        tools.append(box(x0, x1, L['ey1'] - p['TONGUE_D'] - 0.1, L['ey1'] + 0.1, L['iz0'], L['iz1']))
+    s = cut(s, *tools)
+    lz0 = L['ez1'] - p['LEDGE_H']
+    hood = box_outline(p, L, L['ey1'] - 0.01, L['ey2']).common(box(-50, 50, L['ey1'] - 1, L['ey2'] + 1, lz0, L['ez1'] + 1))
+    hood = fillet(hood, 0.8, lambda e: near(e.BoundBox.YMin, L['ey2']) and near(e.BoundBox.YMax, L['ey2'])
+                  and e.BoundBox.ZMin > lz0 + 0.1)
+    tw = L['tab_hw'] + 0.2
+    hood = cut(hood, box(-tw, tw, L['ey1'] - 0.1, L['ey1'] + p['TAB_T'] + 0.15, lz0 - 0.1, L['ez1'] - 0.6))
+    return fuse(s, hood)
+
+
+def make_cover(p, L):
+    """2 mm back cover:
+       * top TAB hooks under the box's top ledge (drop in 1.6 mm low, slide up, done)
+       * full-length side TONGUES sit in rabbets in the side walls -> box-section stiffness,
+         flush seam, no lifting at the sides
+       * 4 countersunk screws (recessed 0.4 mm) at the bottom/middle lock the slide and clamp
+         cover + box + clip together"""
+    lz0 = L['ez1'] - p['LEDGE_H']
+    top = lz0 - 0.15                                    # cover top edge (under the ledge)
+    s = box_outline(p, L, L['ey1'], L['ey2']).common(box(-50, 50, L['ey1'] - 1, L['ey2'] + 1, L['ez0'] - 1, top))
+    s = fillet(s, 1.0, lambda e: near(e.BoundBox.YMin, L['ey2']) and near(e.BoundBox.YMax, L['ey2'])
+               and e.BoundBox.ZMax < top - 0.1)
+    f = []
+    tw = L['tab_hw']
+    f.append(box(-tw, tw, L['ey1'], L['ey1'] + p['TAB_T'], top - 0.5, lz0 + p['SLIDE'] - 0.4))     # top tab (1.2 mm under the ledge)
+    tz0, tz1 = L['iz0'] + p['SLIDE'] + 0.2, L['iz1'] - p['SLIDE'] - 0.2                         # side tongues
+    for sx in (-1, 1):
+        x0, x1 = sorted([sx * (L['int_x1'] - 0.6), sx * (L['int_x1'] + 0.8 - 0.15)])
+        f.append(box(x0, x1, L['ey1'] - p['TONGUE_D'], L['ey1'] + 0.01, tz0, tz1))
+    f.append(box(-2.5, 2.5, L['usb_y1'] + 0.1, L['ey1'] + 0.01, L['usb_z0'] + 1.5 + p['SLIDE'], L['usb_z0'] + 4.5))  # USB-C hold-down
+    for xc in (-6.0, 6.0):                                                                     # battery ribs
+        f.append(box(xc - 0.6, xc + 0.6, L['bat_y1'] + p['BAT_PAD_T'], L['ey1'] + 0.01, L['bat_z0'] + 4, L['bat_z1'] - 4))
+    # bottom FLANGE = the box's bottom wall (lets the body print upside down with no roof over the cavity)
+    f.append(box_outline(p, L, L['y_rp1'] + 0.15, L['ey1'] + 0.01).common(box(-50, 50, L['y_rp1'], L['ey1'] + 1, L['ez0'] - 1, L['iz0'])))
+    s = fuse(s, *f)
+    tools = []
+    for k, (x, z) in enumerate(L['cols']):
+        # column clearance (elongated by the slide distance) + screw hole + recessed countersink
+        if k < 2:   # wall-attached wedge posts
+            sx = 1 if x > 0 else -1
+            x0, x1 = sorted([sx * (L['int_x1'] - 3.6 - 0.35), sx * (L['int_x1'] + 0.9)])
+            tools.append(box(x0, x1, L['ey1'] - p['TONGUE_D'] - 0.1, L['ey1'], z - 2.2 - 0.35, z + 3.2 + 0.35 + p['SLIDE']))
+        tools.append(box(x - p['COL_R'] - 0.35, x + p['COL_R'] + 0.35, L['ey1'] - p['TONGUE_D'] - 0.1, L['ey1'],
+                         z - p['COL_R'] - 0.35, z + p['COL_R'] + 0.35 + p['SLIDE']))
+        tools.append(cyl(p['SCREW_CLR_D'] / 2, x, L['ey1'] - 1.2, z, (0, 1, 0), 5))
+        dcs = (p['CSK_D'] - p['SCREW_CLR_D']) / 2
+        tools.append(Part.makeCone(p['SCREW_CLR_D'] / 2, p['CSK_D'] / 2 + 0.1, dcs + 0.1,
+                                   V(x, L['screw_top'] - dcs, z), V(0, 1, 0)))
+        tools.append(cyl(p['CSK_D'] / 2 + 0.1, x, L['screw_top'], z, (0, 1, 0), p['CSK_RECESS'] + 0.1))
+    hw = p['USB_W'] / 2 + 0.35
+    tools.append(box(-hw, hw, L['by1'] - 0.35, L['usb_y1'] + 0.35, L['ez0'] - 0.1, L['iz0'] + 0.1))   # USB-C opening in the flange
+    tools += usb_cuts(p, L)[1:]
+    s = cut(s, *tools)
+    brand = make_brand(p, L)
+    if brand is not None:
+        try:
+            s2 = s.cut(brand)
+            if s2.isValid() and len(s2.Solids) == 1:
+                s = s2
+        except Exception:
+            pass
+    return s
+
+
+def make_pads(p, L):
+    pads = {}
+    hc = clamp_half(p, L) - 0.6
+    g = hc - p['FINGER_W'] + 1.0
+    pads['Pad_Front_L'] = box(-hc, -g, L['y_lip_in'], 0.0, -p['LIP_H'] + 0.3, 0.0)
+    pads['Pad_Front_R'] = box(g, hc, L['y_lip_in'], 0.0, -p['LIP_H'] + 0.3, 0.0)
+    pads['Pad_Top'] = box(-hc, hc, L['y_lip_in'], L['y_rp0'] - 0.2, 0.0, L['z_top0'])
+    pads['Pad_Rear'] = rprism(-hc + 0.9, hc - 0.9, p['JAW_Z0'] + 1.0, -0.5,                     # on the LED unit's jaw
+                              L['y_rp0'] - p['PAD_T'], L['y_rp0'], 1.5, 'y')
+    pads['Pad_Rear_Low'] = rprism(-15.0, 15.0, L['rp_z0'] + 1.0, p['JAW_Z0'] - p['CLR'] - 0.5,   # on the box front face
+                                  L['y_rp0'] - p['PAD_T'], L['y_rp0'], 1.5, 'y')
+    pads['Pad_Battery'] = box(L['bat_x0'] + 2, L['bat_x1'] - 2, L['bat_y1'], L['bat_y1'] + p['BAT_PAD_T'],
+                              L['bat_z0'] + 2, L['bat_z1'] - 2)
+    return pads
+
+
+def make_components(p, L):
+    c = {}
+    c['XIAO_PCB'] = box(L['bx0'], L['bx1'], L['by0'], L['by1'], L['bz0'], L['bz1'])
+    c['XIAO_USB_C'] = box(-p['USB_W'] / 2, p['USB_W'] / 2, L['by1'], L['usb_y1'], L['usb_z0'], L['usb_z0'] + p['USB_L'])
+    zc = (L['bz0'] + L['bz1']) / 2
+    c['XIAO_ESP32C3_chip'] = box(-2.5, 2.5, L['by1'], L['by1'] + 0.9, zc + 1, zc + 6)
+    c['Battery_LiPo'] = rprism(L['bat_x0'], L['bat_x1'], L['bat_z0'], L['bat_z1'], L['bat_y0'], L['bat_y1'], 1.0, 'y')
+    c['Switch'] = box(L['sw_x0'], L['sw_x1'], L['sw_y0'], L['sw_y1'], L['sw_z0'], L['sw_z1'])
+    yc = (L['sw_y0'] + L['sw_y1']) / 2; zs = (L['sw_z0'] + L['sw_z1']) / 2
+    c['Switch_actuator'] = box(L['sw_x1'], L['sw_x1'] + p['SW_ACT_L'], yc - 0.4, yc + 0.4,
+                               zs - p['SW_ACT_W'] / 2 - p['SW_TRAVEL'] / 2, zs + p['SW_ACT_W'] / 2 - p['SW_TRAVEL'] / 2)
+    c['Diffuser_Strip'] = make_strip(p, L)
+    c['LED_PCB'] = box(-p['LED_PCB_L'] / 2, p['LED_PCB_L'] / 2, L['y_pcb0'], L['y_pcb1'], L['z_h0'], L['z_h0'] + p['LED_PCB_H'])
+    leds = []
+    for i in range(int(p['LED_N'])):
+        x = (i - (p['LED_N'] - 1) / 2) * p['LED_PITCH']
+        leds.append(box(x - 1, x + 1, L['y_led0'], L['y_pcb0'], L['z_led'] - 1, L['z_led'] + 1))
+    c['LEDs_WS2812B_2020'] = fuse(*leds)
+    if p['LED_VARIANT'] == 'strip60' and p.get('LED_LAYOUT') in ('floor', 'single'):
+        C = c5_layout(p, L)
+        ln = C['ls_len']; ym = (C['y_s0'] + C['y_s1']) / 2
+        c['LED_PCB'] = box(-ln / 2, ln / 2, C['y_s0'], C['y_s1'], C['zf'], C['z_fpc1'])
+        c['LEDs_WS2812B_2020'] = fuse(*[box(x - 2.5, x + 2.5, ym - 2.5, ym + 2.5, C['z_fpc1'], C['z_led1'])
+                                         for x in [(i - (p['LS_N'] - 1) / 2) * p['LS_PITCH'] for i in range(int(p['LS_N']))]])
+    elif p['LED_VARIANT'] == 'strip60':
+        C = c60_layout(p, L)
+        ln = C['ls_len']
+        c['LED_PCB'] = box(-ln / 2, ln / 2, C['y_fpc0'], C['y_bk0'], C['zf'] + 0.2, C['zf'] + 0.2 + p['LS_W'])
+        leds = []
+        for i in range(int(p['LS_N'])):
+            x = (i - (p['LS_N'] - 1) / 2) * p['LS_PITCH']
+            leds.append(box(x - 2.5, x + 2.5, C['y_led0'], C['y_fpc0'], C['z_led'] - 2.5, C['z_led'] + 2.5))
+        c['LEDs_WS2812B_2020'] = fuse(*leds)
+    sl = L['screw_len']
+    for i, (x, z) in enumerate(L['cols']):
+        sh = cyl(0.95, x, L['screw_tip'], z, (0, 1, 0), sl)
+        hd = Part.makeCone(1.0, 1.9, 0.9, V(x, L['screw_top'] - 0.9, z), V(0, 1, 0))
+        c['Screw_M2x%d_%d' % (round(sl), i + 1)] = sh.fuse(hd)
+    for i, sx in enumerate((-1, 1)):    # 2 x M2x6 csk joint screws: jaw (from the lid side) -> box blocks
+        x = sx * p['JOINT_X']
+        sh = cyl(0.95, x, L['y_rp0'] + 0.9, L['z_joint'], (0, 1, 0), 5.1)
+        hd = Part.makeCone(1.9, 1.0, 0.9, V(x, L['y_rp0'], L['z_joint']), V(0, 1, 0))
+        c['Screw_Joint_M2x6_%d' % (i + 1)] = sh.fuse(hd)
+    return c
+
+
+# =============================================================================
+# BUILD / EXPORT
+# =============================================================================
+COLORS = {'LED_End_Plug': (0.13, 0.13, 0.15), 'Body': (0.18, 0.18, 0.20), 'Clip_Bridge': (0.16, 0.16, 0.18), 'LED_Housing': (0.13, 0.13, 0.15), 'Diffuser_Strip': (0.93, 0.90, 1.0),
+          'Enclosure_Base': (0.20, 0.20, 0.22), 'Enclosure_Cover': (0.24, 0.24, 0.26), 'Pad': (0.45, 0.45, 0.50),
+          'XIAO': (0.10, 0.45, 0.25), 'USB': (0.75, 0.75, 0.78), 'Battery': (0.85, 0.75, 0.25),
+          'Switch': (0.2, 0.2, 0.2), 'LED': (0.95, 0.95, 0.95), 'Screw': (0.6, 0.6, 0.62)}
+
+
+def color_for(name):
+    for k, v in COLORS.items():
+        if name.startswith(k) or k in name:
+            return v
+    return (0.5, 0.5, 0.5)
+
+
+
+# =============================================================================
+# v12: ONE-PIECE body for an ESP32 SuperMini + TP4056 USB-C charger board
+# =============================================================================
+def layout_sm(p):
+    """Controller box laid out for: battery (top), TP4056 board (middle, USB-C out of the LEFT wall),
+    ESP32 SuperMini (bottom, USB-C out of the LEFT wall), micro switch (RIGHT wall, beside the ESP),
+    2 cover screws at the bottom corners."""
+    L = layout(p)
+    L['int_y'] = p['BOX_DEPTH']
+    L['ey1'] = L['iy0'] + L['int_y']; L['ey2'] = L['ey1'] + p['COVER_T']
+    if p.get('ONE_PIECE'):                       # LED box reaches the back of the controller box: no overhang
+        L['y_h1'] = max(L['y_h1'], L['ey2'])
+    x0, x1 = L['int_x0'], L['int_x1']
+    # battery bay (any 4-6 mm thick cell up to BAY_W x BAY_L)
+    L['bat_z1'] = L['iz1'] - p['TOP_BAND_SM']; L['bat_z0'] = L['bat_z1'] - p['BAY_L']
+    L['bat_x0'], L['bat_x1'] = -p['BAY_W'] / 2, p['BAY_W'] / 2
+    L['bat_y0'] = L['iy0']; L['bat_y1'] = L['iy0'] + p['BAY_T'] - p['BAT_PAD_T']   # where the pad starts
+    # boards: front face on BRD_STANDOFF ribs, USB-C at the left wall
+    L['brd_y0'] = L['iy0'] + p['BRD_STANDOFF']
+    L['tp_z1'] = L['bat_z0'] - 1.4; L['tp_z0'] = L['tp_z1'] - p['TP_W'] - 0.4
+    L['sm_z1'] = L['tp_z0'] - 2.4; L['sm_z0'] = L['sm_z1'] - p['SM_W'] - 0.4
+    L['brd_x0'] = x0 + 0.15
+    # micro switch: right wall, beside the ESP (lever through the wall)
+    L['sw_x1'] = x1; L['sw_x0'] = x1 - p['SW2_W'] - 0.2
+    L['sw_zc'] = (L['sm_z0'] + L['sm_z1']) / 2 + 2.0
+    L['sw_z0'] = L['sw_zc'] - p['SW2_L'] / 2 - 0.15; L['sw_z1'] = L['sw_zc'] + p['SW2_L'] / 2 + 0.15
+    L['sw_y0'] = L['iy0']; L['sw_y1'] = L['iy0'] + p['SW2_H'] + 0.15
+    # 2 cover screw posts under the ESP
+    zc = L['sm_z0'] - 1.6 - p['COL_R']          # below the ESP (its 45 deg fins stay clear of the board)
+    xc = x1 - p['COL_R'] - 0.2
+    L['cols'] = [(-xc, zc), (xc, zc)]
+    L['iz0'] = zc - p['COL_R'] - 0.8; L['ez0'] = L['iz0'] - p['WALL']
+    L['rp_z0'] = L['ez0'] + 1.0
+    L['screw_top'] = L['ey2'] - p['CSK_RECESS']; L['screw_len'] = 6.0; L['screw_tip'] = L['screw_top'] - 6.0
+    L['tab_hw'] = L['int_x1'] - 1.5
+    # USB-C openings (left wall): centred on each board's receptacle
+    L['usb_yc'] = L['brd_y0'] + max(p['SM_PCB'], p['TP_PCB']) + p['BRD_USB_H'] / 2 - 0.1
+    L['tp_usb_zc'] = (L['tp_z0'] + L['tp_z1']) / 2; L['sm_usb_zc'] = (L['sm_z0'] + L['sm_z1']) / 2
+    L['brand_z'] = (L['bat_z0'] + L['bat_z1']) / 2
+    return L
+
+
+def _gusset(iy0, x0, x1, ytip, ztop):
+    """45 deg wedge above a feature's +Z face (that face points DOWN when the body prints upside down)."""
+    d = ytip - iy0
+    pts = [V(x0, iy0 - 0.01, ztop - 0.01), V(x0, ytip, ztop - 0.01), V(x0, iy0 - 0.01, ztop + d), V(x0, iy0 - 0.01, ztop - 0.01)]
+    return Part.Face(Part.makePolygon(pts)).extrude(V(x1 - x0, 0, 0))
+
+
+def make_box_sm(p, L):
+    iy0 = L['iy0']
+    s = box_outline(p, L, L['y_rp0'], L['ey1'])
+    s = cut(s, rprism(L['int_x0'], L['int_x1'], L['iz0'], L['iz1'], iy0, L['ey1'] + 0.1, 1.2, 'y'))
+    s = cut(s, box(-50, 50, L['y_rp1'], L['ey1'] + 1, L['ez0'] - 1, L['iz0']))     # open bottom: the cover's flange closes it
+    f, G = [], []
+    # battery bay: side rails + a divider under it (gap in the middle for wires)
+    for bx0 in (L['bat_x0'] - 0.8, L['bat_x1']):
+        f.append(box(bx0, bx0 + 0.8, iy0 - 0.01, iy0 + 2.5, L['bat_z0'] + 4, L['bat_z1'] - 4))
+        G.append(_gusset(iy0, bx0, bx0 + 0.8, iy0 + 2.5, L['bat_z1'] - 4))
+    for a, b in ((L['int_x0'] - 0.01, -4.0), (4.0, L['int_x1'] + 0.01)):
+        f.append(box(a, b, iy0 - 0.01, iy0 + 2.6, L['bat_z0'] - 1.2, L['bat_z0']))   # short ribs: print as small cantilevers
+    # board slots: ledges above / below each board + standoff ribs under its edges
+    ytop = L['brd_y0'] + max(p['SM_PCB'], p['TP_PCB']) + 0.4
+    for (bz0, bz1, blen) in ((L['tp_z0'], L['tp_z1'], p['TP_L']), (L['sm_z0'], L['sm_z1'], p['SM_L'])):
+        xa, xb = L['brd_x0'] + 10.0, min(L['brd_x0'] + blen - 1.0, L['sw_x0'] - 0.9)
+        f.append(box(xa, xb, iy0 - 0.01, ytop, bz1, bz1 + 0.8))                 # catch above
+        f.append(box(xa, xb, iy0 - 0.01, ytop, bz0 - 0.8, bz0))                 # catch below
+        for zz in (bz0, bz1 - 1.6):                                             # standoffs under the board's edges
+            f.append(box(xa, xb, iy0 - 0.01, L['brd_y0'], zz, zz + 1.6))
+    # micro switch pocket (lies on the front wall, lever out through the right wall)
+    f.append(box(L['sw_x0'] - 0.8, L['int_x1'] + 0.01, iy0 - 0.01, L['sw_y1'] + 0.6, L['sw_z1'], L['sw_z1'] + 0.8))
+    G.append(_gusset(iy0, L['sw_x0'] - 0.8, L['int_x1'] + 0.01, L['sw_y1'] + 0.6, L['sw_z1'] + 0.8))
+    f.append(box(L['sw_x0'] - 0.8, L['int_x1'] + 0.01, iy0 - 0.01, L['sw_y1'] + 0.6, L['sw_z0'] - 0.8, L['sw_z0']))
+    # cover screw posts (45 deg fins so they print upside down)
+    for x, z in L['cols']:
+        f.append(cyl(p['COL_R'], x, iy0 - 0.01, z, (0, 1, 0), L['int_y'] + 0.01))
+        d = p['COL_R'] * 1.414
+        fin = box(-d / 1.414, d / 1.414, iy0 - 0.01, L['ey1'], -d / 1.414, d / 1.414)
+        fin.rotate(V(0, 0, 0), V(0, 1, 0), 45); fin.translate(V(x, 0, z))
+        f.append(fin.common(box(x - 5, x + 5, iy0 - 0.02, L['ey1'], z, z + 5)))
+    s = fuse(s, *(f + G))
+    tools = []
+    for x, z in L['cols']:
+        tools.append(cyl(p['SCREW_PILOT_D'] / 2, x, L['ey1'] - 5.0, z, (0, 1, 0), 5.1))
+    # LED wires: big hole through the box top under the LED box's wire hole
+    if p.get('LED_LAYOUT') == 'single':
+        C = c5_layout(p, L)
+        wy0, wy1 = wire_hole_y(p, L, C)
+        tools.append(box(p['PX_L'] / 2 + 0.6, C['x_int'] - 0.6, wy0, wy1, L['iz1'] - 0.2, L['ez1'] + 0.1))
+    # USB-C openings in the LEFT wall (+ a recess outside so the plug's overmould seats)
+    hw, hh = 4.9, 2.1
+    for zc in (L['tp_usb_zc'], L['sm_usb_zc']):
+        tools.append(box(L['ex0'] - 0.1, L['int_x0'] + 0.1, L['usb_yc'] - hh, L['usb_yc'] + hh, zc - hw, zc + hw))
+        tools.append(box(L['ex0'] - 0.1, L['ex0'] + 0.6, L['usb_yc'] - 3.4, L['usb_yc'] + 3.4, zc - 6.4, zc + 6.4))
+    # switch lever slot (right wall) + a shallow finger recess outside
+    sl = (1.0 + p['SW2_TRAVEL']) / 2 + 0.3
+    ly = (L['sw_y0'] + L['sw_y1']) / 2
+    tools.append(box(L['int_x1'] - 0.1, L['ex1'] + 0.1, ly - 0.75, ly + 0.75, L['sw_zc'] - sl, L['sw_zc'] + sl))
+    tools.append(box(L['ex1'] - 0.7, L['ex1'] + 0.1, ly - 2.2, ly + 2.2, L['sw_zc'] - sl - 1.5, L['sw_zc'] + sl + 1.5))
+    # side rabbets for the cover's tongues
+    for sx in (-1, 1):
+        x0, x1 = sorted([sx * L['int_x1'], sx * (L['int_x1'] + 0.8)])
+        tools.append(box(x0, x1, L['ey1'] - p['TONGUE_D'] - 0.1, L['ey1'] + 0.1, L['iz0'], L['iz1']))
+    s = cut(s, *tools)
+    # top ledge (hood) that the cover's tab hooks under
+    lz0 = L['ez1'] - p['LEDGE_H']
+    hood = box_outline(p, L, L['ey1'] - 0.01, L['ey2']).common(box(-50, 50, L['ey1'] - 1, L['ey2'] + 1, lz0, L['ez1'] + 0.01))
+    tw = L['tab_hw'] + 0.2
+    hood = cut(hood, box(-tw, tw, L['ey1'] - 0.1, L['ey1'] + p['TAB_T'] + 0.15, lz0 - 0.1, L['ez1'] - 0.6))
+    return fuse(s, hood)
+
+
+def make_cover_sm(p, L):
+    lz0 = L['ez1'] - p['LEDGE_H']
+    top = lz0 - 0.15
+    s = box_outline(p, L, L['ey1'], L['ey2']).common(box(-50, 50, L['ey1'] - 1, L['ey2'] + 1, L['ez0'] - 1, top))
+    s = fillet(s, 1.0, lambda e: near(e.BoundBox.YMin, L['ey2']) and near(e.BoundBox.YMax, L['ey2'])
+               and e.BoundBox.ZMax < top - 0.1)
+    f = []
+    tw = L['tab_hw']
+    f.append(box(-tw, tw, L['ey1'], L['ey1'] + p['TAB_T'], top - 0.5, lz0 + p['SLIDE'] - 0.4))       # top tab
+    tz0, tz1 = L['iz0'] + p['SLIDE'] + 0.2, L['iz1'] - p['SLIDE'] - 0.2                               # side tongues
+    for sx in (-1, 1):
+        x0, x1 = sorted([sx * (L['int_x1'] - 0.6), sx * (L['int_x1'] + 0.8 - 0.15)])
+        f.append(box(x0, x1, L['ey1'] - p['TONGUE_D'], L['ey1'] + 0.01, tz0, tz1))
+    for xc in (-6.0, 6.0):                                                                           # battery press ribs
+        f.append(box(xc - 0.6, xc + 0.6, L['bat_y1'] + p['BAT_PAD_T'], L['ey1'] + 0.01, L['bat_z0'] + 4, L['bat_z1'] - 4))
+    usb_top = L['brd_y0'] + max(p['SM_PCB'], p['TP_PCB']) + p['BRD_USB_H']
+    for zc in (L['tp_usb_zc'], L['sm_usb_zc']):                                                      # hold the boards down by their USB-C shells
+        f.append(box(L['brd_x0'] + 1.5, L['brd_x0'] + 6.5, usb_top + 0.05, L['ey1'] + 0.01, zc - 2.0 + p['SLIDE'], zc + 2.0))
+    f.append(box(L['sw_x0'] + 0.2, L['int_x1'] - 0.3, L['sw_y1'] + 0.05, L['ey1'] + 0.01,               # keeps the switch in its pocket
+                 L['sw_z0'] + 0.3 + p['SLIDE'], L['sw_z1'] - 0.3))
+    # bottom FLANGE = the box's bottom wall
+    f.append(box_outline(p, L, L['y_rp1'] + 0.15, L['ey1'] + 0.01).common(box(-50, 50, L['y_rp1'], L['ey1'] + 1, L['ez0'] - 1, L['iz0'])))
+    s = fuse(s, *f)
+    tools = []
+    for x, z in L['cols']:
+        tools.append(box(x - p['COL_R'] - 0.35, x + p['COL_R'] + 0.35, L['ey1'] - p['TONGUE_D'] - 0.1, L['ey1'],
+                         z - p['COL_R'] - 0.35, z + p['COL_R'] + 0.35 + p['SLIDE']))
+        tools.append(cyl(p['SCREW_CLR_D'] / 2, x, L['ey1'] - 1.2, z, (0, 1, 0), 5))
+        dcs = (p['CSK_D'] - p['SCREW_CLR_D']) / 2
+        tools.append(Part.makeCone(p['SCREW_CLR_D'] / 2, p['CSK_D'] / 2 + 0.1, dcs + 0.1, V(x, L['screw_top'] - dcs, z), V(0, 1, 0)))
+        tools.append(cyl(p['CSK_D'] / 2 + 0.1, x, L['screw_top'], z, (0, 1, 0), p['CSK_RECESS'] + 0.1))
+    return cut(s, *tools)
+
+
+def make_components_sm(p, L):
+    c = {}
+    y0 = L['brd_y0']
+    for name, z0, ln, pcb in (('TP4056', L['tp_z0'], p['TP_L'] - 1.4, p['TP_PCB']), ('ESP32_SuperMini', L['sm_z0'], p['SM_L'], p['SM_PCB'])):
+        w = p['TP_W'] if name == 'TP4056' else p['SM_W']
+        zc = z0 + 0.2 + w / 2
+        c[name + '_PCB'] = box(L['brd_x0'], L['brd_x0'] + ln, y0, y0 + pcb, z0 + 0.2, z0 + 0.2 + w)
+        c[name + '_USB_C'] = box(L['brd_x0'], L['brd_x0'] + 7.4, y0 + pcb, y0 + pcb + 3.2, zc - 4.47, zc + 4.47)
+    c['Battery_LiPo'] = rprism(L['bat_x0'] + 0.25, L['bat_x1'] - 0.25, L['bat_z0'] + 0.25, L['bat_z1'] - 0.25,
+                               L['bat_y0'], L['bat_y0'] + 6.0, 1.0, 'y')                      # largest cell the bay takes
+    c['Switch'] = box(L['sw_x0'] + 0.1, L['int_x1'] - 0.1, L['sw_y0'], L['sw_y0'] + p['SW2_H'], L['sw_zc'] - p['SW2_L'] / 2, L['sw_zc'] + p['SW2_L'] / 2)
+    ly = (L['sw_y0'] + L['sw_y1']) / 2
+    c['Switch_actuator'] = box(L['int_x1'] - 0.1, L['int_x1'] - 0.1 + p['SW2_LEVER'], ly - 0.4, ly + 0.4, L['sw_zc'] - 0.5, L['sw_zc'] + 0.5)
+    if p.get('LED_LAYOUT') == 'single':
+        C = c5_layout(p, L)
+        ym = (C['y_s0'] + C['y_s1']) / 2
+        c['LED_PCB'] = box(-p['PX_L'] / 2 + 0.2, p['PX_L'] / 2 - 0.2, C['y_s0'] + 0.2, C['y_s1'] - 0.2, C['zf'], C['z_fpc1'])
+        c['LEDs_WS2812B_2020'] = box(-2.5, 2.5, ym - 2.5, ym + 2.5, C['z_fpc1'], C['z_led1'])
+    c['Diffuser_Strip'] = make_strip(p, L)
+    sl = L['screw_len']
+    for i, (x, z) in enumerate(L['cols']):
+        sh = cyl(0.95, x, L['screw_tip'], z, (0, 1, 0), sl)
+        hd = Part.makeCone(1.0, 1.9, 0.9, V(x, L['screw_top'] - 0.9, z), V(0, 1, 0))
+        c['Screw_M2x6_%d' % (i + 1)] = sh.fuse(hd)
+    return c
+
+
+def build_sm(p):
+    L = layout_sm(p)
+    body = make_led_unit(p, L).fuse(make_box_sm(p, L)).removeSplitter()
+    parts = {'Body': body, 'Enclosure_Cover': make_cover_sm(p, L), 'LED_End_Plug': make_end_plug(p, L)}
+    return L, parts, make_pads(p, L), make_components_sm(p, L)
+
+
+def build(p=P):
+    if p.get('BOARD') == 'supermini':
+        return build_sm(p)
+    L = layout(p)
+    cap = make_led_unit(p, L) if p['LED_VARIANT'] == 'strip60' else make_led_housing(p, L)
+    parts = {'Body': make_body(p, L), 'LED_Housing': cap, 'Enclosure_Cover': make_cover(p, L)}
+    if p['LED_VARIANT'] == 'strip60':
+        parts['LED_End_Plug'] = make_end_plug(p, L)
+    return L, parts, make_pads(p, L), make_components(p, L)
+
+
+PRINT_ORIENT = {
+    'Body': (V(1, 0, 0), 180),             # upside down: flat top (clip + box) on the bed
+    'LED_Housing': (V(1, 0, 0), 180),      # 32 mm cap: roof down (60 mm strip cap: see cap_orient)
+    'Enclosure_Cover': (V(1, 0, 0), -90),  # outer face down
+    'LED_End_Plug': (V(1, 0, 0), 90),      # lies flat
+}
+PAD_ORIENT = {'Pad_Front_L': (V(1, 0, 0), 90), 'Pad_Front_R': (V(1, 0, 0), 90), 'Pad_Top': None,
+              'Pad_Rear': (V(1, 0, 0), 90), 'Pad_Rear_Low': (V(1, 0, 0), 90), 'Pad_Battery': (V(1, 0, 0), 90)}
+
+
+def cap_orient(p):
+    return (V(0, 1, 0), -90) if p['LED_VARIANT'] == 'strip60' else (V(1, 0, 0), 180)   # LED unit stands on its left end
+
+
+def export_all(outdir, p=P):
+    import MeshPart, Import
+    L, parts, pads, comps = build(p)
+    for d in ('STL', 'STEP'):
+        os.makedirs(os.path.join(outdir, d), exist_ok=True)
+    doc = App.newDocument('AgentDot')
+    objs = []
+    for grp, d in (('print', parts), ('tpu', pads), ('ref', comps)):
+        for n, s in d.items():
+            o = doc.addObject('Part::Feature', n); o.Shape = s; objs.append(o)
+            if App.GuiUp:
+                o.ViewObject.ShapeColor = color_for(n)
+            if grp != 'ref':
+                Import.export([o], os.path.join(outdir, 'STEP', n + '.step'))
+    doc.recompute()
+    Import.export(objs, os.path.join(outdir, 'STEP', 'AgentDot_Assembly.step'))
+    doc.saveAs(os.path.join(outdir, 'AgentDot.FCStd'))
+
+    def stl(shape, path):
+        MeshPart.meshFromShape(Shape=shape, LinearDeflection=0.02, AngularDeflection=0.2, Relative=False).write(path)
+    for n, s in parts.items():
+        stl(to_bed(s, cap_orient(p) if n == 'LED_Housing' else PRINT_ORIENT[n]), os.path.join(outdir, 'STL', n + '.stl'))
+    for n, s in pads.items():
+        stl(to_bed(s, PAD_ORIENT[n]), os.path.join(outdir, 'STL', 'TPU_' + n + '.stl'))
+    return doc, L, parts, pads, comps
+
+
+if EXPORT_DIR:
+    export_all(EXPORT_DIR)
+elif App.GuiUp:
+    L, parts, pads, comps = build(P)
+    doc = App.newDocument('AgentDot')
+    for d in (parts, pads, comps):
+        for n, s in d.items():
+            o = doc.addObject('Part::Feature', n); o.Shape = s
+            o.ViewObject.ShapeColor = color_for(n)
+    doc.recompute()
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView('ViewFit'); FreeCADGui.activeDocument().activeView().viewIsometric()
